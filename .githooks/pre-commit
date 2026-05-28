@@ -1,0 +1,33 @@
+#!/bin/sh
+# Pre-commit quality gate for Hooky_McHookface.
+#
+# Runs the three SPEC §4 gates — ruff, mypy --strict, pytest — and blocks the
+# commit if any fail. These drifted to 32 ruff + 8 mypy errors during v1
+# because nothing enforced them; this hook is the root-cause fix.
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+# Bypass in a pinch:       git commit --no-verify   (use sparingly)
+
+set -e
+
+# Locate the project virtualenv interpreter (Windows or POSIX layout), falling
+# back to whatever `python` is on PATH. mypy --strict must run in the project
+# env so it sees fastapi/pydantic/etc. — an isolated tool env would mis-report.
+if [ -x ".venv/Scripts/python.exe" ]; then
+    PY=".venv/Scripts/python.exe"
+elif [ -x ".venv/bin/python" ]; then
+    PY=".venv/bin/python"
+else
+    PY="python"
+fi
+
+echo "[pre-commit] ruff check..."
+"$PY" -m ruff check src tests
+
+echo "[pre-commit] mypy --strict..."
+"$PY" -m mypy src
+
+echo "[pre-commit] pytest..."
+"$PY" -m pytest -q
+
+echo "[pre-commit] all gates passed."

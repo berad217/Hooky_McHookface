@@ -1,0 +1,54 @@
+# Example Hooky_McHookface config (v1, all sprints).
+# Copy to config.yaml and edit. Secrets are NEVER in this file — they're named
+# by env var and read at startup. See SPEC §6 and the README for details.
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  log_level: INFO
+  log_format: json               # json (default) | console
+
+storage:
+  backend: sqlite
+  path: data/hooky.db
+  retention_days: 30             # 0 = keep forever
+
+# Handlers loaded by dotted import path + registered at startup.
+# Omit this section for a receiver that only stores (no dispatch).
+#   path:       "package.module:ClassName" -> a WebhookHandler subclass
+#   config:     non-secret kwargs           -> ClassName(**config)
+#   secret_env: kwarg_name -> ENV_VAR       -> read from env, passed as kwargs
+# Secrets go in secret_env (never config), so they stay out of this file.
+handlers:
+  - path: "hooky.handlers.logger:LoggerHandler"
+  # - path: "myapp.handlers:SmsHandler"
+  #   config:
+  #     from_number: "+15551234567"     # non-secret
+  #   secret_env:
+  #     api_token: MYAPP_API_TOKEN      # value read from $MYAPP_API_TOKEN at startup
+
+# Per-path signature validators. A bad/missing signature on a guarded path is
+# stored (signature_valid=0) and rejected with 401 — never silently dropped.
+validators:
+  - path: /webhook/github
+    type: github
+    secret_env: GITHUB_WEBHOOK_SECRET
+  # - path: /webhook/stripe
+  #   type: stripe
+  #   secret_env: STRIPE_WEBHOOK_SECRET
+  #   tolerance_seconds: 300
+  # - path: /webhook/custom
+  #   type: generic_hmac
+  #   secret_env: CUSTOM_WEBHOOK_SECRET
+  #   header: x-signature
+  #   algorithm: sha256            # sha256 | sha1
+  #   prefix: ""                   # e.g. "sha256=" for some providers
+
+tunnel:
+  provider: none                 # none (default) | ngrok | cloudflare
+  ngrok:
+    region: us
+    # auth token from env NGROK_AUTH_TOKEN
+  cloudflare:
+    hostname: hooky-main.example.com   # public hostname routed to this server
+    # token from env CLOUDFLARED_TOKEN
