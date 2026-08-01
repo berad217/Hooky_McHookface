@@ -144,3 +144,28 @@ class StorageBackend(ABC):
                 errors propagate so a sig-update failure surfaces as 5xx
                 rather than a silent inconsistency.
         """
+
+    @abstractmethod
+    async def purge_before(self, cutoff: datetime) -> int:
+        """Delete stored webhooks received before ``cutoff``. Returns the count.
+
+        The enforcement half of ``storage.retention_days``, which shipped as a
+        declared-but-dead config field in Sprint 1 ("Enforcement not in Sprint
+        1"). Until it existed, the store-first invariant had no counterweight:
+        every webhook body is persisted BEFORE the validator and BEFORE handler
+        dispatch, so a request that is ultimately rejected — a bad signature, or
+        a sender a handler denies — is kept in full, forever. "We never lose a
+        webhook" is the right default for a debugging tool; "we never forget
+        one" is a different promise nobody made.
+
+        Handler runs for the purged webhooks go with them: the ``handler_runs``
+        row references ``webhooks(id)``, so orphaning them would leave dangling
+        references and defeat the point (the run's ``return_value`` can echo
+        request-derived data).
+
+        Args:
+            cutoff: Delete webhooks whose ``received_at`` is strictly older.
+
+        Returns:
+            Number of webhook rows deleted.
+        """

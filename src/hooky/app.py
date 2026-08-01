@@ -23,8 +23,10 @@ production.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 
 from fastapi import FastAPI
 
@@ -41,6 +43,20 @@ from hooky.validators.base import SignatureValidator
 from hooky.validators.registry import build_validator_map
 
 logger = get_logger(__name__)
+
+#: How often the retention purge re-runs while the app is up. Daily: retention
+#: is expressed in days, so a finer cadence buys nothing and a coarser one lets
+#: a long-lived process drift past its own policy.
+_PURGE_INTERVAL_SECONDS = 24 * 60 * 60
+
+
+async def _cancel(task: asyncio.Task[None]) -> None:
+    """Cancel a background task and await its exit. Never raises."""
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):  # noqa: B014 — shutdown must not raise
+        pass
 
 
 def create_app(
@@ -87,11 +103,51 @@ def create_app(
         tunnel if tunnel is not None else build_tunnel(cfg.tunnel)
     )
 
+    async def _purge_once() -> None:
+        """Apply ``storage.retention_days`` once. Never raises."""
+        try:
+            cutoff = datetime.now(UTC) - timedelta(days=cfg.storage.retention_days)
+            deleted = await backend.purge_before(cutoff)
+            if deleted:
+                logger.info(
+                    "storage_purged",
+                    deleted=deleted,
+                    retention_days=cfg.storage.retention_days,
+                    cutoff=cutoff.isoformat(),
+                )
+        except Exception as exc:  # noqa: BLE001 — retention must never take the app down
+            logger.error(
+                "storage_purge_failed", error=str(exc), error_type=type(exc).__name__
+            )
+
+    async def _purge_loop() -> None:
+        """Re-apply retention daily.
+
+        Startup-only would be a gesture, not a fix: this process is a service
+        that can run for months between restarts, so a purge that only fires at
+        boot leaves an unbounded store for exactly the deployments that need it
+        most. Sleeps FIRST because startup already purged.
+        """
+        while True:
+            await asyncio.sleep(_PURGE_INTERVAL_SECONDS)
+            await _purge_once()
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        purge_task: asyncio.Task[None] | None = None
         if owns_storage:
             await backend.connect()
             logger.info("storage_connected", path=cfg.storage.path)
+
+        # Retention (storage.retention_days; 0 = keep forever). The counterweight
+        # to the store-first invariant: every body is persisted BEFORE the
+        # validator and BEFORE handler dispatch, so rejected requests — bad
+        # signature, or a sender a handler denies — are kept in full. Without
+        # this they were kept forever, and a backup that replicates the DB
+        # off-machine carries them along.
+        if cfg.storage.retention_days > 0:
+            await _purge_once()
+            purge_task = asyncio.create_task(_purge_loop())
 
         if owns_tunnel:
             try:
@@ -102,7 +158,11 @@ def create_app(
                     public_url=public_url,
                 )
             except Exception:
-                # If startup fails, still close anything we already opened.
+                # If startup fails, still close anything we already opened —
+                # including the purge task, which would otherwise keep firing
+                # against a closed backend.
+                if purge_task is not None:
+                    await _cancel(purge_task)
                 if owns_storage:
                     await backend.close()
                 raise
@@ -110,6 +170,10 @@ def create_app(
         try:
             yield
         finally:
+            # Cancel BEFORE closing storage, so a purge in flight cannot race a
+            # closing connection.
+            if purge_task is not None:
+                await _cancel(purge_task)
             # Stop tunnel first (it depends on storage to be irrelevant, but
             # consistent order helps reasoning about shutdown).
             if owns_tunnel:

@@ -152,6 +152,33 @@ class AsyncSQLiteStorage(StorageBackend):
         await conn.commit()
         return stored
 
+    async def purge_before(self, cutoff: datetime) -> int:
+        """Delete webhooks received before ``cutoff`` (and their handler runs).
+
+        Handler runs go first: ``handler_runs.webhook_id`` references
+        ``webhooks(id)``, so deleting the parent first would leave dangling rows
+        whose ``return_value`` can echo request-derived data — the exact content
+        retention is meant to expire.
+
+        Both statements run inside one transaction and commit together, so a
+        crash mid-purge cannot leave handler runs orphaned from their webhooks.
+        """
+        conn = self._require_conn()
+        iso = cutoff.isoformat()
+        await conn.execute(
+            """
+            DELETE FROM handler_runs
+             WHERE webhook_id IN (SELECT id FROM webhooks WHERE received_at < ?)
+            """,
+            (iso,),
+        )
+        cursor = await conn.execute(
+            "DELETE FROM webhooks WHERE received_at < ?", (iso,)
+        )
+        deleted = cursor.rowcount or 0
+        await conn.commit()
+        return deleted
+
     async def get(self, webhook_id: str) -> StoredWebhook | None:
         """Look up a stored webhook by id."""
         conn = self._require_conn()

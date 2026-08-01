@@ -47,8 +47,12 @@ class StorageConfig(BaseModel):
         default=30,
         ge=0,
         description=(
-            "Retention period in days. 0 means keep forever. "
-            "(Enforcement not in Sprint 1.)"
+            "Retention period in days. 0 means keep forever. Enforced on "
+            "startup and once daily thereafter: webhooks older than this (and "
+            "their handler runs) are deleted. This is the counterweight to the "
+            "store-first invariant — every body is persisted before the "
+            "validator and before handler dispatch, so rejected requests are "
+            "kept in full until retention expires them."
         ),
     )
 

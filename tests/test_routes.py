@@ -183,6 +183,9 @@ class _RaisingStorage(StorageBackend):
     async def get_handler_runs(self, webhook_id: str) -> list[Any]:
         return []
 
+    async def purge_before(self, cutoff: Any) -> int:
+        return 0
+
     async def last_received_at(self) -> Any:
         return None
 

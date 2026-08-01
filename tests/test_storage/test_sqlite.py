@@ -220,3 +220,78 @@ async def test_file_backed_storage_persists_across_reconnect(tmp_path: Path) -> 
 
     assert fetched is not None
     assert fetched.id == stored.id
+
+
+# --- retention (purge_before) ------------------------------------------------
+#
+# The counterweight to the store-first invariant: every body is persisted BEFORE
+# the validator and BEFORE handler dispatch, so a rejected request -- a bad
+# signature, or a sender a handler denies -- is kept in full. "We never lose a
+# webhook" is the right default for a debugging tool; "we never forget one" is a
+# different promise, and until retention was enforced the store made it silently.
+
+
+async def test_purge_before_deletes_only_older_rows(
+    storage: AsyncSQLiteStorage,
+) -> None:
+    now = datetime.now(UTC)
+    old = await storage.store(_make_webhook(received_at=now - timedelta(days=45)))
+    recent = await storage.store(_make_webhook(received_at=now - timedelta(days=2)))
+
+    deleted = await storage.purge_before(now - timedelta(days=30))
+
+    assert deleted == 1
+    assert await storage.get(old.id) is None
+    assert await storage.get(recent.id) is not None
+
+
+async def test_purge_takes_handler_runs_with_it(storage: AsyncSQLiteStorage) -> None:
+    """handler_runs.webhook_id references webhooks(id), so orphaning them would
+    leave dangling rows -- and a run's return_value can echo request-derived
+    data, which is exactly the content retention exists to expire."""
+    now = datetime.now(UTC)
+    old = await storage.store(_make_webhook(received_at=now - timedelta(days=45)))
+    await storage.record_handler_run(
+        HandlerResult(
+            webhook_id=old.id,
+            handler_name="telegram",
+            started_at=now - timedelta(days=45),
+            completed_at=now - timedelta(days=45),
+            success=True,
+            return_value={"sender_hash": "abc123"},
+        )
+    )
+    assert await storage.get_handler_runs(old.id) != []
+
+    await storage.purge_before(now - timedelta(days=30))
+
+    assert await storage.get_handler_runs(old.id) == []
+
+
+async def test_purge_keeps_handler_runs_of_surviving_webhooks(
+    storage: AsyncSQLiteStorage,
+) -> None:
+    """The delete is scoped by the subquery, not by date on handler_runs -- a
+    recent webhook's runs must survive even if an old sibling is purged."""
+    now = datetime.now(UTC)
+    await storage.store(_make_webhook(received_at=now - timedelta(days=45)))
+    recent = await storage.store(_make_webhook(received_at=now - timedelta(days=1)))
+    await storage.record_handler_run(
+        HandlerResult(
+            webhook_id=recent.id,
+            handler_name="telegram",
+            started_at=now,
+            completed_at=now,
+            success=True,
+        )
+    )
+
+    await storage.purge_before(now - timedelta(days=30))
+
+    assert len(await storage.get_handler_runs(recent.id)) == 1
+
+
+async def test_purge_on_an_empty_store_is_a_no_op(
+    storage: AsyncSQLiteStorage,
+) -> None:
+    assert await storage.purge_before(datetime.now(UTC)) == 0
