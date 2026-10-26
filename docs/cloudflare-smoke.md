@@ -23,7 +23,8 @@ exercises.
    `HTTP` → `localhost:8000`.
 4. `cloudflared` installed locally and on PATH:
    `winget install --id Cloudflare.cloudflared` (reopen the shell afterward).
-   Verify: `cloudflared --version`.
+   Verify: `cloudflared --version` reports at least 2026.10.2. `start()` refuses
+   anything older (`MIN_CLOUDFLARED_VERSION` in `cloudflare.py`).
 
 ## Step 1 — smoke config
 
@@ -126,7 +127,8 @@ MODERATE to HIGH and tick the last open SPEC §6 "still outstanding" item.
 
 | Symptom | Likely cause | Where |
 |---|---|---|
-| `'cloudflared' not found on PATH` at start | binary not installed / shell not reopened | `cloudflare.py:_spawn` PATH check |
+| `'cloudflared' not found on PATH` at start | binary not installed / shell not reopened | `cloudflare.py:_require_on_path` |
+| `cloudflared X is below the minimum` or `Could not read a version` | old or dev-build cloudflared; the floor fails closed | `_check_version`; upgrade with `winget upgrade --id Cloudflare.cloudflared` |
 | Hang ~30s then "Readiness marker not seen" | bad token, tunnel down on CF side, or a cloudflared version with a 3rd marker phrasing | `start()` timeout; `_READY_MARKERS` |
 | Starts then `/healthz` flips to `error` | cloudflared crashed after registering | `_watch_output` sets `_last_error`, clears `_url` |
 | `hooky stop` slow (~5s) then exits | cloudflared ignored SIGTERM; escalated to SIGKILL | `_terminate_proc` grace → kill |

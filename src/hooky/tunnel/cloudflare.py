@@ -15,6 +15,10 @@ had a stub for this but never built it). The design:
   Idempotent.
 - ``health()`` returns cached state — connected once we saw the marker,
   error if the process exited unexpectedly, disconnected before/after.
+- Before spawning, ``start()`` runs ``cloudflared --version`` and refuses
+  (fails closed) when the binary is older than ``MIN_CLOUDFLARED_VERSION``
+  or its version can't be read. An old connector is a security hole, not a
+  degraded mode, so it never runs.
 
 A subprocess-watcher task observes the process and updates the cached
 state if cloudflared crashes after start. That way ``/healthz`` reports
@@ -25,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import signal
 from collections.abc import Mapping
@@ -49,6 +54,65 @@ _READY_MARKERS = (b"Connection registered", b"Registered tunnel connection")
 # Bounds on how long we'll wait for the readiness marker before giving up.
 _DEFAULT_STARTUP_TIMEOUT = 30.0
 
+# The oldest cloudflared Hooky will run. Releases before 2026.10.2 still trust
+# eight eMudhra (emSign) intermediate certificates whose private keys are weak,
+# so anyone holding a forged certificate can impersonate Cloudflare's edge to
+# the connector (Cloudflare advisory, 2026-10-20). Raise this on the next one.
+MIN_CLOUDFLARED_VERSION = "2026.10.2"
+
+# ``cloudflared --version`` prints e.g.
+# "cloudflared version 2026.10.4 (built 2026-10-26T02:34 UTC)".
+_CLOUDFLARED_VERSION_RE = re.compile(r"cloudflared version (\d+)\.(\d+)\.(\d+)")
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+_VERSION_PROBE_TIMEOUT = 10.0
+
+
+def _version_tuple(match: re.Match[str]) -> tuple[int, int, int]:
+    """Turn a three-group version match into a comparable tuple."""
+    return (int(match[1]), int(match[2]), int(match[3]))
+
+
+def _require_on_path(binary: str) -> None:
+    """Raise an actionable TunnelError when ``binary`` isn't on PATH."""
+    if shutil.which(binary) is None:
+        raise TunnelError(
+            f"'{binary}' not found on PATH. Install cloudflared from "
+            "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/."
+        )
+
+
+async def _probe_version(binary: str) -> str:
+    """Run ``<binary> --version`` and return its combined output. Test seam.
+
+    Args:
+        binary: The cloudflared executable to ask.
+
+    Returns:
+        The decoded stdout+stderr of ``--version``.
+
+    Raises:
+        TunnelError: If the binary is missing, can't be run, or doesn't
+            answer within ``_VERSION_PROBE_TIMEOUT`` seconds.
+    """
+    _require_on_path(binary)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            binary,
+            "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except OSError as exc:
+        raise TunnelError(f"Failed to run '{binary} --version': {exc}") from exc
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_VERSION_PROBE_TIMEOUT)
+    except TimeoutError as exc:
+        proc.kill()
+        raise TunnelError(
+            f"'{binary} --version' did not answer within {_VERSION_PROBE_TIMEOUT}s."
+        ) from exc
+    return out.decode("utf-8", "replace")
+
 
 class CloudflareProvider(TunnelProvider):
     """Run ``cloudflared`` as a managed subprocess.
@@ -62,6 +126,8 @@ class CloudflareProvider(TunnelProvider):
             itself never reports it back over its log stream.
         binary: Path to the ``cloudflared`` binary. Defaults to whatever
             is on ``$PATH``. Tests inject a stub.
+        min_version: Oldest cloudflared release ``start()`` will run, as
+            ``"YYYY.M.P"``. Defaults to ``MIN_CLOUDFLARED_VERSION``.
         startup_timeout: Seconds to wait for the readiness marker before
             considering startup failed. Default 30s.
         terminate_grace: Seconds to wait after SIGTERM before escalating to
@@ -75,7 +141,8 @@ class CloudflareProvider(TunnelProvider):
             uses ``asyncio.create_subprocess_exec``.
 
     Raises:
-        ValueError: If ``token`` or ``hostname`` is empty.
+        ValueError: If ``token`` or ``hostname`` is empty, or ``min_version``
+            isn't a ``YYYY.M.P`` version.
     """
 
     def __init__(
@@ -84,6 +151,7 @@ class CloudflareProvider(TunnelProvider):
         hostname: str,
         *,
         binary: str = "cloudflared",
+        min_version: str = MIN_CLOUDFLARED_VERSION,
         startup_timeout: float = _DEFAULT_STARTUP_TIMEOUT,
         terminate_grace: float = 5.0,
         watcher_join_timeout: float = 2.0,
@@ -93,9 +161,14 @@ class CloudflareProvider(TunnelProvider):
             raise ValueError("CloudflareProvider requires a non-empty token.")
         if not hostname:
             raise ValueError("CloudflareProvider requires a non-empty hostname.")
+        floor = _VERSION_RE.fullmatch(min_version)
+        if floor is None:
+            raise ValueError(f"min_version must look like 'YYYY.M.P', got {min_version!r}.")
         self._token = token
         self._hostname = hostname
         self._binary = binary
+        self._min_version = min_version
+        self._floor = _version_tuple(floor)
         self._startup_timeout = startup_timeout
         self._terminate_grace = terminate_grace
         self._watcher_join_timeout = watcher_join_timeout
@@ -117,16 +190,36 @@ class CloudflareProvider(TunnelProvider):
         if self._subprocess_factory is not None:
             return cast("asyncio.subprocess.Process", await self._subprocess_factory(argv))
 
-        if shutil.which(self._binary) is None:
-            raise TunnelError(
-                f"'{self._binary}' not found on PATH. Install cloudflared from "
-                "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/."
-            )
+        _require_on_path(self._binary)
         return await asyncio.create_subprocess_exec(
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
+
+    async def _check_version(self) -> None:
+        """Refuse a cloudflared older than ``min_version``. Fails closed.
+
+        Raises:
+            TunnelError: If the binary's version is below the floor, or can't
+                be read from ``--version`` at all.
+        """
+        output = await _probe_version(self._binary)
+        found = _CLOUDFLARED_VERSION_RE.search(output)
+        if found is None:
+            raise TunnelError(
+                f"Could not read a version from '{self._binary} --version' "
+                f"(got {output.strip()[:80]!r}); refusing to start without "
+                f"proof it is at least {self._min_version}."
+            )
+        version = ".".join(found.groups())
+        if _version_tuple(found) < self._floor:
+            raise TunnelError(
+                f"cloudflared {version} is below the minimum {self._min_version}: "
+                "older releases trust compromised eMudhra certificates. Upgrade it "
+                "(Windows: winget upgrade --id Cloudflare.cloudflared) and restart."
+            )
+        logger.info("cloudflared_version_ok", version=version, minimum=self._min_version)
 
     async def start(self, port: int) -> str:
         """Launch cloudflared, wait for the readiness marker, return public URL.
@@ -143,7 +236,8 @@ class CloudflareProvider(TunnelProvider):
             ``"https://{hostname}"``.
 
         Raises:
-            TunnelError: If cloudflared can't be spawned, exits before the
+            TunnelError: If cloudflared is older than ``min_version`` (or its
+                version can't be read), can't be spawned, exits before the
                 readiness marker, or the marker isn't seen within
                 ``startup_timeout``.
         """
@@ -155,6 +249,12 @@ class CloudflareProvider(TunnelProvider):
         # Fresh start: clear stale state from a previous failed attempt.
         self._ready = asyncio.Event()
         self._last_error = None
+
+        try:
+            await self._check_version()
+        except TunnelError as exc:
+            self._last_error = str(exc)
+            raise
 
         try:
             proc = await self._spawn()

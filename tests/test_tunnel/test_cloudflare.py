@@ -8,12 +8,37 @@ script line-by-line.
 from __future__ import annotations
 
 import asyncio
+import sys
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
 
+import hooky.tunnel.cloudflare as cloudflare_mod
 from hooky.tunnel.base import TunnelError, TunnelStatus
-from hooky.tunnel.cloudflare import CloudflareProvider
+from hooky.tunnel.cloudflare import MIN_CLOUDFLARED_VERSION, CloudflareProvider
+
+_REAL_PROBE = cloudflare_mod._probe_version
+
+
+def _probe_answering(output: str) -> Callable[[str], Awaitable[str]]:
+    """A stand-in for ``_probe_version`` that prints ``output``."""
+
+    async def _probe(binary: str) -> str:
+        return output
+
+    return _probe
+
+
+@pytest.fixture(autouse=True)
+def _compliant_cloudflared(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test here runs against a cloudflared that clears the version
+    floor, unless it patches ``_probe_version`` itself (the floor tests do)."""
+    monkeypatch.setattr(
+        cloudflare_mod,
+        "_probe_version",
+        _probe_answering("cloudflared version 2026.10.4 (built 2026-10-26T02:34 UTC)\n"),
+    )
 
 
 class _FakeStream:
@@ -443,3 +468,105 @@ async def test_stop_swallows_already_reaped_and_cancels_stuck_watcher() -> None:
     )
     await p.start(8000)
     await p.stop()  # must not raise despite the reaped proc + stuck watcher
+
+
+# ----------------------------------------------------------------------------
+# Version floor: an old cloudflared trusts compromised eMudhra certificates,
+# so start() refuses it before anything is spawned (fail closed).
+# ----------------------------------------------------------------------------
+
+
+def _never_spawned() -> Callable[[list[str]], Awaitable[Any]]:
+    """A subprocess_factory that fails the test if the tunnel is ever spawned."""
+
+    async def _factory(argv: list[str]) -> Any:
+        raise AssertionError(f"cloudflared spawned despite the version floor: {argv}")
+
+    return _factory
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "cloudflared version 2026.5.2 (built 2026-05-27T10:15 UTC)\n",
+        "cloudflared version 2026.10.1 (built 2026-10-15T17:15 UTC)\n",
+        # Numeric, not string, comparison: "2026.9.30" > "2026.10.2" as text.
+        "cloudflared version 2026.9.30 (built 2026-09-30T00:00 UTC)\n",
+    ],
+)
+async def test_start_refuses_cloudflared_below_floor(
+    monkeypatch: pytest.MonkeyPatch, output: str
+) -> None:
+    monkeypatch.setattr(cloudflare_mod, "_probe_version", _probe_answering(output))
+    p = CloudflareProvider(
+        token="tok", hostname="h.example.com", subprocess_factory=_never_spawned()
+    )
+    with pytest.raises(TunnelError, match="below the minimum"):
+        await p.start(8000)
+    h = await p.health()
+    assert h.status is TunnelStatus.ERROR
+    assert MIN_CLOUDFLARED_VERSION in (h.error or "")
+
+
+async def test_start_refuses_unreadable_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dev build or garbage output can't prove it's patched, so it's refused."""
+    monkeypatch.setattr(
+        cloudflare_mod, "_probe_version", _probe_answering("cloudflared version DEV\n")
+    )
+    p = CloudflareProvider(
+        token="tok", hostname="h.example.com", subprocess_factory=_never_spawned()
+    )
+    with pytest.raises(TunnelError, match="Could not read a version"):
+        await p.start(8000)
+    assert (await p.health()).status is TunnelStatus.ERROR
+
+
+async def test_start_accepts_cloudflared_at_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cloudflare_mod,
+        "_probe_version",
+        _probe_answering(f"cloudflared version {MIN_CLOUDFLARED_VERSION} (built x)\n"),
+    )
+    proc = _FakeProcess([b"Connection registered\n"])
+    p = CloudflareProvider(
+        token="tok", hostname="h.example.com", subprocess_factory=_factory_returning(proc)
+    )
+    assert (await p.start(8000)) == "https://h.example.com"
+
+
+async def test_custom_min_version_raises_the_floor() -> None:
+    """min_version above the default refuses the (otherwise fine) 2026.10.4."""
+    p = CloudflareProvider(
+        token="tok",
+        hostname="h.example.com",
+        min_version="2027.1.0",
+        subprocess_factory=_never_spawned(),
+    )
+    with pytest.raises(TunnelError, match="below the minimum 2027.1.0"):
+        await p.start(8000)
+
+
+def test_malformed_min_version_rejected() -> None:
+    with pytest.raises(ValueError, match="min_version"):
+        CloudflareProvider(token="t", hostname="h.example.com", min_version="latest")
+
+
+async def test_probe_missing_binary_raises_tunnelerror() -> None:
+    with pytest.raises(TunnelError, match="not found on PATH"):
+        await _REAL_PROBE("cloudflared-does-not-exist-xyz")
+
+
+async def test_real_probe_refuses_a_binary_that_is_not_cloudflared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end through a real subprocess: ``python --version`` says
+    "Python 3.x", which is no proof of a patched cloudflared."""
+    monkeypatch.setattr(cloudflare_mod, "_probe_version", _REAL_PROBE)
+    p = CloudflareProvider(
+        token="tok",
+        hostname="h.example.com",
+        binary=sys.executable,
+        subprocess_factory=_never_spawned(),
+    )
+    with pytest.raises(TunnelError, match="Could not read a version"):
+        await p.start(8000)

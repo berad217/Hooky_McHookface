@@ -769,3 +769,38 @@ split follows the established `_terminate_server` pattern, and the core property
 by a real-socket test, not a mock. **Note:** this hardens *every* Hooky-hosted server, but
 only takes effect on a service **restart** — a running instance keeps its old non-exclusive
 socket until then.
+
+## cloudflared version floor, fail-closed (2026-10-26)
+
+### Why
+Cloudflare's 2026-10-20 advisory: eight eMudhra (emSign) intermediate certificates have
+weak private keys, so anyone can mint a certificate for any host. cloudflared releases
+before **2026.10.2** still trust them, which means a man-in-the-middle could pose as
+Cloudflare's edge to the connector. For Beaker, that means reading or forging Telegram
+webhooks (secret header included) and injecting the `Cf-Access` header `/admin` trusts.
+The box ran 2026.5.2 until today. Upgrading the binary fixed it once; this makes the next
+stale binary refuse to run instead of relying on someone remembering.
+
+### Change
+- `MIN_CLOUDFLARED_VERSION = "2026.10.2"` in `tunnel/cloudflare.py`. `start()` runs
+  `cloudflared --version` (`_probe_version`, a module-level test seam) before spawning and
+  raises `TunnelError` when the version is below the floor **or can't be read** (a dev
+  build or anything else is no proof of a patched binary). Health reports `ERROR` with the
+  reason. Because app startup re-raises tunnel failures, the server exits and the service
+  manager keeps retrying: loud, by design (Brad chose fail-closed over warn-and-degrade).
+- `CloudflareProvider(min_version=...)` can raise the floor; a malformed value is a
+  `ValueError` at construction. Comparison is numeric (2026.9.30 < 2026.10.2).
+- The PATH check moved into `_require_on_path`, shared by the probe and `_spawn`.
+- README and `docs/cloudflare-smoke.md` state the floor and the new failure messages.
+
+### Verification
+9 new tests (below-floor x3 incl. the numeric-compare case, unreadable version, exactly at
+the floor, raised floor, malformed `min_version`, missing binary through the real probe,
+and a real subprocess end to end: `python --version` is refused). Existing tests run
+against a compliant probe via an autouse fixture. **251 passed**; ruff clean;
+`mypy --strict` clean (36 files). The real probe against the installed binary logs
+`cloudflared_version_ok version=2026.10.4 minimum=2026.10.2`.
+
+### Confidence
+**HIGH.** The check runs before anything is spawned and fails closed on every path that
+isn't a parsed version at or above the floor. Takes effect on the next service restart.

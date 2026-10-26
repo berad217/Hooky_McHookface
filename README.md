@@ -71,7 +71,9 @@ pip install -e ".[ngrok]"      # optional: pyngrok, only if you use the ngrok tu
 ```
 
 Python 3.11+. `cloudflared` (for the Cloudflare tunnel) is an external binary —
-install separately if you use `provider: cloudflare`.
+install separately if you use `provider: cloudflare`. Hooky refuses to start the
+tunnel on anything older than `MIN_CLOUDFLARED_VERSION` (2026.10.2; older releases
+trust compromised eMudhra certificates).
 
 ## Quickstart (under 60 seconds)
 
